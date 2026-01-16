@@ -33,6 +33,9 @@ directories to find `llama.cpp`, or `PATH` unless you set it in the menu.
 Model auto-detection searches common locations including `./models`, `./llama.cpp/models`,
 `/models`, `~/models`, `~/Models`, `~/Downloads`, and `~/.cache/lm-studio/models`.
 
+If you need to access the server from another machine, set `LLAMA_SERVER_HOST=0.0.0.0`
+so nginx and llama-server bind to all interfaces (default is `127.0.0.1`).
+
 ```bash
 ./run_llama_tests.py
 ```
