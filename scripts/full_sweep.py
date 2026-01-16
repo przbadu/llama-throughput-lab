@@ -1,0 +1,246 @@
+import os
+import shlex
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+from tests.llama_server_test_utils import (
+    extract_token_count,
+    post_json,
+    start_llama_servers,
+    start_nginx_round_robin,
+)
+
+
+def parse_int_list(value, default):
+    raw = value or default
+    parts = [item.strip() for item in raw.replace(",", " ").split()]
+    return [int(item) for item in parts if item]
+
+
+def build_server_args(base_args, parallel):
+    if base_args:
+        args = shlex.split(base_args)
+    else:
+        args = []
+
+    cleaned = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--parallel":
+            skip_next = True
+            continue
+        cleaned.append(arg)
+
+    cleaned += ["--parallel", str(parallel)]
+    return cleaned
+
+
+def post_json_with_retry(url, payload, timeout, max_attempts, base_sleep_s):
+    for attempt in range(max_attempts):
+        try:
+            return post_json(url, payload, timeout=timeout)
+        except RuntimeError as exc:
+            message = str(exc)
+            retryable = any(
+                code in message
+                for code in (
+                    "HTTP error 500",
+                    "HTTP error 502",
+                    "HTTP error 503",
+                    "HTTP error 504",
+                    "Loading model",
+                )
+            )
+            if retryable:
+                if attempt == max_attempts - 1:
+                    raise
+                time.sleep(base_sleep_s * (attempt + 1))
+                continue
+            raise
+
+
+def run_batch(
+    base_url,
+    prompt,
+    n_predict,
+    concurrency,
+    total_requests,
+    temperature,
+    request_timeout,
+    retry_attempts,
+    retry_sleep_s,
+):
+    start_time = time.time()
+    results = []
+    errors = 0
+    last_error = None
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [
+            executor.submit(
+                post_json_with_retry,
+                f"{base_url}/completion",
+                {
+                    "prompt": prompt,
+                    "n_predict": n_predict,
+                    "temperature": temperature,
+                    "stream": False,
+                },
+                request_timeout,
+                retry_attempts,
+                retry_sleep_s,
+            )
+            for _ in range(total_requests)
+        ]
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                errors += 1
+                last_error = exc
+
+    elapsed = time.time() - start_time
+    total_tokens = sum(extract_token_count(result) for result in results)
+    throughput = total_tokens / elapsed if elapsed > 0 else 0.0
+
+    return {
+        "throughput": throughput,
+        "total_tokens": total_tokens,
+        "elapsed": elapsed,
+        "errors": errors,
+        "last_error": last_error,
+    }
+
+
+def main():
+    prompt = os.environ.get(
+        "LLAMA_PROMPT",
+        "Share three optimization tips for model serving.",
+    )
+    temperature = float(os.environ.get("LLAMA_TEMPERATURE", "0.3"))
+    n_predict = int(os.environ.get("LLAMA_N_PREDICT", "128"))
+
+    instances_list = parse_int_list(
+        os.environ.get("LLAMA_INSTANCES_LIST"),
+        "2,4,8,16",
+    )
+    parallel_list = parse_int_list(
+        os.environ.get("LLAMA_PARALLEL_LIST"),
+        "1,2,4,8,16,32,64",
+    )
+    concurrency_list = parse_int_list(
+        os.environ.get("LLAMA_CONCURRENCY_LIST"),
+        "1,2,4,8,16,32,64,128,256,512,1024",
+    )
+
+    base_port = int(os.environ.get("LLAMA_SERVER_BASE_PORT", "9000"))
+    nginx_port = int(os.environ.get("LLAMA_NGINX_PORT", "8088"))
+    base_args = os.environ.get("LLAMA_SERVER_ARGS", "")
+
+    ready_timeout_s = int(os.environ.get("LLAMA_READY_TIMEOUT", "180"))
+    startup_delay_s = float(os.environ.get("LLAMA_STARTUP_DELAY_S", "0.0"))
+    warmup_requests = int(os.environ.get("LLAMA_WARMUP_REQUESTS", "2"))
+    request_timeout = float(os.environ.get("LLAMA_REQUEST_TIMEOUT", "120"))
+    retry_attempts = int(os.environ.get("LLAMA_RETRY_ATTEMPTS", "8"))
+    retry_sleep_s = float(os.environ.get("LLAMA_RETRY_SLEEP_S", "0.5"))
+    cell_pause_s = float(os.environ.get("LLAMA_CELL_PAUSE_S", "0.0"))
+    requests_multiplier = int(os.environ.get("LLAMA_REQUESTS_MULTIPLIER", "1"))
+    total_requests_env = os.environ.get("LLAMA_NUM_REQUESTS")
+
+    if requests_multiplier < 1:
+        requests_multiplier = 1
+
+    print(
+        "instances,parallel,concurrency,throughput_tps,total_tokens,elapsed_s,errors"
+    )
+
+    best = {
+        "throughput": 0.0,
+        "instances": None,
+        "parallel": None,
+        "concurrency": None,
+    }
+
+    for instances in instances_list:
+        for parallel in parallel_list:
+            server_args = build_server_args(base_args, parallel)
+            with start_llama_servers(
+                instances,
+                base_port=base_port,
+                extra_args=server_args,
+                ready_timeout_s=ready_timeout_s,
+                startup_delay_s=startup_delay_s,
+            ) as servers:
+                upstreams = [(server["host"], server["port"]) for server in servers]
+                with start_nginx_round_robin(
+                    upstreams,
+                    listen_port=nginx_port,
+                    listen_host=servers[0]["host"],
+                ) as proxy:
+                    if warmup_requests > 0:
+                        for _ in range(warmup_requests):
+                            post_json_with_retry(
+                                f"{proxy['base_url']}/completion",
+                                {
+                                    "prompt": "warmup",
+                                    "n_predict": 8,
+                                    "temperature": 0.0,
+                                    "stream": False,
+                                },
+                                request_timeout,
+                                retry_attempts,
+                                retry_sleep_s,
+                            )
+
+                    for concurrency in concurrency_list:
+                        if total_requests_env:
+                            total_requests = int(total_requests_env)
+                        else:
+                            total_requests = max(
+                                1, concurrency * requests_multiplier
+                            )
+                        result = run_batch(
+                            proxy["base_url"],
+                            prompt,
+                            n_predict,
+                            concurrency,
+                            total_requests,
+                            temperature,
+                            request_timeout,
+                            retry_attempts,
+                            retry_sleep_s,
+                        )
+                        print(
+                            f"{instances},{parallel},{concurrency},"
+                            f"{result['throughput']:.1f},"
+                            f"{result['total_tokens']},"
+                            f"{result['elapsed']:.2f},"
+                            f"{result['errors']}"
+                        )
+                        if result["throughput"] > best["throughput"]:
+                            best = {
+                                "throughput": result["throughput"],
+                                "instances": instances,
+                                "parallel": parallel,
+                                "concurrency": concurrency,
+                            }
+                        if cell_pause_s > 0:
+                            time.sleep(cell_pause_s)
+
+    print(
+        "best "
+        f"instances={best['instances']} "
+        f"parallel={best['parallel']} "
+        f"concurrency={best['concurrency']} "
+        f"throughput_tps={best['throughput']:.1f}"
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# --- Configuration ---
+SCRIPT_DIR = Path(__file__).parent.resolve()
+
+TESTS = {
+    "1": ("Tests: Single request", ["-m", "unittest", "tests/test_llama_server_single.py"]),
+    "2": ("Tests: Concurrent requests", ["-m", "unittest", "tests/test_llama_server_concurrent.py"]),
+    "3": ("Tests: Round-robin (nginx + multiple servers)", ["-m", "unittest", "tests/test_llama_server_round_robin.py"]),
+    "4": ("Sweeps: Threads (--threads/--threads-http)", ["tests/test_llama_server_threads_sweep.py"]),
+    "5": ("Sweeps: Round-robin (max_tokens x concurrency)", ["scripts/round_robin_sweep.py"]),
+    "6": ("Sweeps: Full (instances x parallel x concurrency)", ["scripts/full_sweep.py"]),
+}
+
+
+def check_dependencies():
+    if not shutil.which("dialog"):
+        print("Error: 'dialog' is required. Install it (e.g., brew install dialog).")
+        sys.exit(1)
+
+
+def run_dialog(args):
+    with tempfile.NamedTemporaryFile(mode="w+") as tf:
+        cmd = ["dialog"] + args
+        try:
+            res = subprocess.run(cmd, stderr=tf, check=False)
+            tf.seek(0)
+            return tf.read().strip(), res.returncode
+        except Exception:
+            return None, 1
+
+
+def show_msg(title, msg):
+    run_dialog(["--title", title, "--msgbox", msg, "10", "60"])
+
+
+def get_directory_contents(path):
+    try:
+        if not os.path.isdir(path):
+            return [], []
+
+        entries = os.listdir(path)
+        dirs = []
+        files = []
+
+        for entry in entries:
+            full_path = os.path.join(path, entry)
+            if os.path.isdir(full_path):
+                dirs.append(entry)
+            elif entry.endswith(".gguf"):
+                files.append(entry)
+
+        dirs.sort()
+        files.sort()
+        return dirs, files
+    except PermissionError:
+        return [], []
+
+
+def custom_file_picker(start_path):
+    current_path = os.path.abspath(start_path)
+    if not os.path.isdir(current_path):
+        current_path = os.getcwd()
+
+    while True:
+        dirs, files = get_directory_contents(current_path)
+        menu_items = []
+
+        if current_path != "/":
+            menu_items.extend(["..", "Parent Directory"])
+
+        for directory in dirs:
+            menu_items.extend([directory + "/", "<DIR>"])
+
+        for file_name in files:
+            menu_items.extend([file_name, "<GGUF>"])
+
+        if not menu_items:
+            menu_items.extend([".", "Empty Directory"])
+
+        pretty_path = current_path
+        if len(pretty_path) > 50:
+            pretty_path = "..." + pretty_path[-47:]
+
+        selection, code = run_dialog(
+            [
+                "--title",
+                "Select GGUF File",
+                "--backtitle",
+                f"Current: {pretty_path}",
+                "--menu",
+                "Navigate directories and select a .gguf file:",
+                "20",
+                "70",
+                "12",
+                *menu_items,
+            ]
+        )
+
+        if code != 0:
+            return None
+
+        clean = selection.strip()
+        if clean == "..":
+            current_path = os.path.dirname(current_path)
+        elif clean.endswith("/"):
+            current_path = os.path.join(current_path, clean[:-1])
+        elif clean == ".":
+            pass
+        else:
+            return os.path.join(current_path, clean)
+
+
+def _parse_model_dirs(raw):
+    if not raw:
+        return []
+    parts = []
+    for chunk in raw.split(os.pathsep):
+        for item in chunk.split(","):
+            item = item.strip()
+            if item:
+                parts.append(os.path.expanduser(item))
+    return parts
+
+
+def _find_gguf_in_dir(base_dir, max_depth):
+    if not base_dir or not os.path.isdir(base_dir):
+        return None, None
+
+    best_path = None
+    best_mtime = None
+    base_dir = os.path.abspath(base_dir)
+
+    for root, dirs, files in os.walk(base_dir):
+        rel_path = os.path.relpath(root, base_dir)
+        depth = 0 if rel_path == "." else rel_path.count(os.sep) + 1
+        if depth >= max_depth:
+            dirs[:] = []
+
+        for file_name in files:
+            if not file_name.endswith(".gguf"):
+                continue
+            path = os.path.join(root, file_name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if best_mtime is None or mtime > best_mtime:
+                best_mtime = mtime
+                best_path = path
+
+    return best_path, best_mtime
+
+
+def auto_detect_model():
+    env_model = os.environ.get("LLAMA_MODEL_PATH")
+    if env_model and os.path.isfile(env_model):
+        return env_model
+
+    model_dirs = _parse_model_dirs(os.environ.get("LLAMA_MODEL_DIRS"))
+    if not model_dirs:
+        home = str(Path.home())
+        model_dirs = [
+            os.path.join(SCRIPT_DIR, "models"),
+            os.path.join(SCRIPT_DIR, "llama.cpp", "models"),
+            os.path.join(home, "models"),
+            os.path.join(home, "Downloads"),
+            os.path.join(home, ".cache", "lm-studio", "models"),
+        ]
+
+    max_depth = int(os.environ.get("LLAMA_MODEL_SEARCH_DEPTH", "4"))
+    best_path = None
+    best_mtime = None
+
+    for base_dir in model_dirs:
+        path, mtime = _find_gguf_in_dir(base_dir, max_depth)
+        if path and (best_mtime is None or mtime > best_mtime):
+            best_path = path
+            best_mtime = mtime
+
+    return best_path or ""
+
+
+def auto_detect_server_bin():
+    env_bin = os.environ.get("LLAMA_SERVER_BIN")
+    if env_bin and os.path.isfile(env_bin):
+        return env_bin
+
+    cpp_dir = os.environ.get("LLAMA_CPP_DIR")
+    candidates = []
+    if cpp_dir:
+        candidates.append(os.path.join(cpp_dir, "build", "bin", "llama-server"))
+
+    candidates.append(os.path.join(SCRIPT_DIR, "llama.cpp", "build", "bin", "llama-server"))
+    candidates.append(shutil.which("llama-server") or "")
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    return ""
+
+
+def find_python():
+    venv_python = SCRIPT_DIR / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable or "python3"
+
+
+def parse_env_overrides(raw):
+    overrides = {}
+    if not raw:
+        return overrides
+    for token in shlex.split(raw):
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        if key:
+            overrides[key] = value
+    return overrides
+
+
+class AppState:
+    def __init__(self):
+        self.model_path = auto_detect_model()
+        self.server_bin = auto_detect_server_bin()
+        self.env_overrides = ""
+        self.test_key = "1"
+
+    @property
+    def test_label(self):
+        return TESTS[self.test_key][0]
+
+
+def select_test(state):
+    items = []
+    for key in sorted(TESTS.keys(), key=int):
+        items.extend([key, TESTS[key][0]])
+    selection, code = run_dialog(
+        [
+            "--title",
+            "Select Test",
+            "--menu",
+            "Choose a test or sweep to run:",
+            "18",
+            "70",
+            "8",
+            *items,
+        ]
+    )
+    if code == 0 and selection:
+        state.test_key = selection
+
+
+def select_model(state):
+    start_path = state.model_path or os.getcwd()
+    if os.path.isfile(start_path):
+        start_path = os.path.dirname(start_path)
+    selection = custom_file_picker(start_path)
+    if selection:
+        state.model_path = selection
+
+
+def edit_env_overrides(state):
+    selection, code = run_dialog(
+        [
+            "--title",
+            "Environment Overrides",
+            "--inputbox",
+            "Enter KEY=VALUE pairs separated by spaces.\n"
+            "Example: LLAMA_CONCURRENCY=64 LLAMA_NUM_REQUESTS=64",
+            "12",
+            "70",
+            state.env_overrides,
+        ]
+    )
+    if code == 0:
+        state.env_overrides = selection.strip()
+
+
+def edit_server_bin(state):
+    current = state.server_bin or ""
+    selection, code = run_dialog(
+        [
+            "--title",
+            "llama-server Binary",
+            "--inputbox",
+            "Enter the path to llama-server.\nLeave empty to rely on auto-detect or PATH.",
+            "12",
+            "70",
+            current,
+        ]
+    )
+    if code == 0:
+        state.server_bin = selection.strip()
+
+
+def run_selected(state):
+    python_bin = find_python()
+    label, args = TESTS[state.test_key]
+    cmd = [python_bin] + args
+
+    overrides = parse_env_overrides(state.env_overrides)
+    if state.model_path and "LLAMA_MODEL_PATH" not in overrides:
+        overrides["LLAMA_MODEL_PATH"] = state.model_path
+    if state.server_bin and "LLAMA_SERVER_BIN" not in overrides:
+        overrides["LLAMA_SERVER_BIN"] = state.server_bin
+
+    env = os.environ.copy()
+    env.update(overrides)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(SCRIPT_DIR), env.get("PYTHONPATH", "")]
+    ).strip(os.pathsep)
+
+    subprocess.run(["clear"])
+    print("=== Running Llama.cpp Test ===")
+    print(f"Test:  {label}")
+    if state.model_path:
+        print(f"Model: {state.model_path}")
+    if state.env_overrides:
+        print(f"Env:   {state.env_overrides}")
+    print("--------------------------------")
+    print(f"CMD: {' '.join(cmd)}")
+    print("")
+
+    proc = subprocess.Popen(cmd, cwd=str(SCRIPT_DIR), env=env)
+    proc.wait()
+
+    input("\nRun complete. Press Enter to return to menu...")
+
+
+def main_menu():
+    state = AppState()
+
+    while True:
+        model_display = Path(state.model_path).name if state.model_path else "(None)"
+        server_display = Path(state.server_bin).name if state.server_bin else "(Auto)"
+        env_display = state.env_overrides if state.env_overrides else "(None)"
+
+        menu = [
+            "--clear",
+            "--backtitle",
+            "Llama.cpp Local Test Launcher",
+            "--title",
+            "Main Menu",
+            "--menu",
+            "Select an option to configure or run:",
+            "20",
+            "70",
+            "8",
+            "1",
+            f"Test:   {state.test_label}",
+            "2",
+            f"Model:  {model_display}",
+            "3",
+            f"Server: {server_display}",
+            "4",
+            f"Env:    {env_display}",
+            "5",
+            "RUN SELECTED TEST",
+            "6",
+            "Exit",
+        ]
+
+        choice, code = run_dialog(menu)
+        if code != 0:
+            break
+
+        if choice == "1":
+            select_test(state)
+        elif choice == "2":
+            select_model(state)
+        elif choice == "3":
+            edit_server_bin(state)
+        elif choice == "4":
+            edit_env_overrides(state)
+        elif choice == "5":
+            run_selected(state)
+        elif choice == "6":
+            break
+
+    subprocess.run(["clear"])
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    check_dependencies()
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        subprocess.run(["clear"])
+        sys.exit(0)
